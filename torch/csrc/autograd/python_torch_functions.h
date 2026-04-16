@@ -20,6 +20,23 @@ inline PyObject* TypeError_to_NotImplemented_(
   return ret;
 }
 
+// METH_FASTCALL | METH_KEYWORDS variant
+template <
+    PyObject* (*Func)(PyObject*, PyObject* const*, Py_ssize_t, PyObject*)>
+inline PyObject* TypeError_to_NotImplemented_(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames) {
+  PyObject* ret = Func(self, args, nargs, kwnames);
+  if (!ret && PyErr_ExceptionMatches(PyExc_TypeError)) {
+    PyErr_Clear();
+    Py_INCREF(Py_NotImplemented);
+    ret = Py_NotImplemented;
+  }
+  return ret;
+}
+
 void initTorchFunctions(PyObject* module);
 
 } // namespace torch::autograd

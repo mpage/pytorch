@@ -731,6 +731,64 @@ auto handle_torch_function(
       r, nullptr, args, kwargs, torch_api, module_name, func_name_override);
 }
 
+// Build a tuple and dict from fastcall args for __torch_function__ dispatch
+static std::pair<py::tuple, py::object> fastcall_to_tuple_and_dict(
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames) {
+  py::tuple args_tuple(nargs);
+  for (Py_ssize_t i = 0; i < nargs; i++) {
+    args_tuple[i] = py::handle(args[i]);
+  }
+
+  py::object kwargs_dict;
+  if (kwnames) {
+    auto num_kwnames = PyTuple_GET_SIZE(kwnames);
+    if (num_kwnames > 0) {
+      auto d = py::dict();
+      for (Py_ssize_t j = 0; j < num_kwnames; j++) {
+        d[py::handle(PyTuple_GET_ITEM(kwnames, j))] =
+            py::handle(args[nargs + j]);
+      }
+      kwargs_dict = std::move(d);
+    }
+  }
+  return {std::move(args_tuple), std::move(kwargs_dict)};
+}
+
+auto handle_torch_function(
+    PythonArgs& r,
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames,
+    PyObject* torch_api,
+    const char* module_name,
+    const char* func_name_override) -> PyObject* {
+  auto [args_tuple, kwargs_dict] =
+      fastcall_to_tuple_and_dict(args, nargs, kwnames);
+  return handle_torch_function(
+      r,
+      self,
+      args_tuple.ptr(),
+      kwargs_dict.ptr(),
+      torch_api,
+      module_name,
+      func_name_override);
+}
+
+auto handle_torch_function(
+    PythonArgs& r,
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames,
+    PyObject* torch_api,
+    const char* module_name,
+    const char* func_name_override) -> PyObject* {
+  return handle_torch_function(
+      r, nullptr, args, nargs, kwnames, torch_api, module_name, func_name_override);
+}
+
 auto handle_torch_function_indexing(
     PyObject* self,
     PyObject* index,
@@ -1924,6 +1982,322 @@ void PythonArgParser::print_error(
   auto options = get_signatures();
   auto msg =
       torch::format_invalid_args(args, kwargs, function_name + "()", options);
+  TORCH_CHECK_TYPE(false, msg);
+}
+
+// Lookup a keyword argument by name in the fastcall kwnames tuple.
+// Returns the value (from args[nargs + index]) or nullptr if not found.
+static PyObject* find_keyword_arg(
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames,
+    PyObject* key,
+    Py_ssize_t num_kwnames) {
+  for (Py_ssize_t j = 0; j < num_kwnames; j++) {
+    PyObject* kwname = PyTuple_GET_ITEM(kwnames, j);
+    // Interned string pointer comparison - both kwnames entries from CPython
+    // and param.python_name (via THPUtils_internString) are interned.
+    if (kwname == key) {
+      return args[nargs + j];
+    }
+  }
+  return nullptr;
+}
+
+// Variant of is_int_or_symint_list for a C array of PyObject* (fastcall).
+static bool is_int_or_symint_list_fastcall(
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    int broadcast_size,
+    int64_t* failed_idx = nullptr,
+    std::vector<PyObject*>* overloaded_args = nullptr) {
+  if (nargs == 0) {
+    return true;
+  }
+
+  bool has_torch_func = false;
+
+  for (Py_ssize_t idx = 0; idx < nargs; idx++) {
+    PyObject* item_ptr = args[idx];
+
+    if (overloaded_args &&
+        check_has_torch_function(item_ptr, /*ignore_mode*/ true)) {
+      append_overloaded_arg(overloaded_args, item_ptr, /*obj_is_type*/ false);
+      has_torch_func = true;
+    }
+
+    if (idx == 0) {
+      if (is_int_or_symint(item_ptr)) {
+        continue;
+      }
+
+      // NOTE: JIT tracer allows arbitrary scalar tensors to act as ints
+      // in an intlist argument. Even float or complex scalar tensors.
+      bool r =
+          (jit::tracer::isTracing() && THPVariable_Check(item_ptr) &&
+           THPVariable_Unpack(item_ptr).sizes().empty());
+      if (!r && failed_idx != nullptr) {
+        *failed_idx = 0;
+      }
+      if (!r && !has_torch_func) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+// Create a PyTuple from a C array of PyObject* (for varargs IntArrayRef).
+static PyObject* make_tuple_from_array(
+    PyObject* const* args,
+    Py_ssize_t nargs) {
+  PyObject* tuple = PyTuple_New(nargs);
+  if (!tuple) {
+    return nullptr;
+  }
+  for (Py_ssize_t i = 0; i < nargs; i++) {
+    Py_INCREF(args[i]);
+    PyTuple_SET_ITEM(tuple, i, args[i]);
+  }
+  return tuple;
+}
+
+bool FunctionSignature::parse(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames,
+    PyObject* dst[], // NOLINT
+    std::vector<PyObject*>& overloaded_args,
+    bool raise_exception,
+    py::object& varargs_tuple_out) {
+  Py_ssize_t num_kwnames = kwnames ? PyTuple_GET_SIZE(kwnames) : 0;
+  auto remaining_kwargs = num_kwnames;
+  size_t arg_pos = 0;
+  bool allow_varargs_intlist = false;
+
+  // if there is a single positional IntArrayRef argument, i.e. expand(..),
+  // view(...), allow a var-args style IntArrayRef, so expand(5,3) behaves as
+  // expand((5,3))
+  if (max_pos_args == 1 &&
+      (params[0].type_ == ParameterType::INT_LIST ||
+       params[0].type_ == ParameterType::SYM_INT_LIST)) {
+    int64_t failed_idx = -1;
+    allow_varargs_intlist = is_int_or_symint_list_fastcall(
+        args, nargs, params[0].size, &failed_idx, &overloaded_args);
+  }
+
+  if (static_cast<size_t>(nargs) > max_pos_args && !allow_varargs_intlist) {
+    if (raise_exception) {
+      extra_args(*this, nargs);
+    }
+    return false;
+  }
+
+  int i = 0;
+  if (self != nullptr && check_has_torch_function(self, /*ignore_mode*/ true)) {
+    append_overloaded_tensor(&overloaded_args, self);
+  }
+  for (auto& param : params) {
+    PyObject* obj = nullptr;
+    bool is_kwd = false;
+    if (arg_pos < static_cast<size_t>(nargs)) {
+      if (param.keyword_only) {
+        if (raise_exception) {
+          extra_args(*this, nargs);
+        }
+        return false;
+      }
+      obj = const_cast<PyObject*>(args[arg_pos]);
+    } else if (num_kwnames > 0) {
+      obj = find_keyword_arg(args, nargs, kwnames, param.python_name, num_kwnames);
+      if (!obj) {
+        for (PyObject* numpy_name : param.numpy_python_names) {
+          obj = find_keyword_arg(args, nargs, kwnames, numpy_name, num_kwnames);
+          if (obj) {
+            break;
+          }
+        }
+      }
+      is_kwd = true;
+    }
+
+    int64_t failed_idx = -1;
+    bool varargs_eligible = allow_varargs_intlist && arg_pos == 0 && !is_kwd;
+    if ((!obj && param.optional) || (obj == Py_None && param.allow_none)) {
+      dst[i++] = nullptr;
+    } else if (!obj) {
+      if (raise_exception) {
+        missing_args(*this, i);
+      }
+      return false;
+    } else if (param.check(obj, overloaded_args, i, &failed_idx)) {
+      dst[i++] = obj;
+    } else if (
+        varargs_eligible &&
+        (is_int_or_symint_list_fastcall(
+            args, nargs, param.size, &failed_idx, &overloaded_args))) {
+      // take all positional arguments as this parameter
+      // e.g. permute(1, 2, 3) -> permute((1, 2, 3))
+      // Create a temporary tuple so downstream accessors (intlist, symintlist)
+      // can use PyTuple_GET_ITEM.
+      varargs_tuple_out = py::reinterpret_steal<py::object>(
+          make_tuple_from_array(args, nargs));
+      dst[i++] = varargs_tuple_out.ptr();
+      arg_pos = nargs;
+      continue;
+    } else if (raise_exception) {
+      if (is_kwd) {
+        TORCH_CHECK_TYPE(
+            false,
+            fmt::format(
+                "{}(): argument '{}' must be {}, not {}",
+                name,
+                param.name,
+                param.type_name(),
+                Py_TYPE(obj)->tp_name));
+      } else {
+        if (failed_idx != -1) {
+          // For varargs case, create a temporary tuple for error reporting
+          PyObject* err_obj = obj;
+          py::object temp_tuple;
+          if (!(PyTuple_Check(obj) || PyList_Check(obj))) {
+            TORCH_INTERNAL_ASSERT(varargs_eligible);
+            temp_tuple = py::reinterpret_steal<py::object>(
+                make_tuple_from_array(args, nargs));
+            err_obj = temp_tuple.ptr();
+          }
+          TORCH_INTERNAL_ASSERT(failed_idx < PySequence_Size(err_obj));
+          TORCH_CHECK_TYPE(
+              false,
+              fmt::format(
+                  "{}(): argument '{}' (position {}) must be {}, but found element of type {} at pos {}",
+                  name,
+                  param.name,
+                  arg_pos + 1,
+                  param.type_name(),
+                  Py_TYPE(py::reinterpret_steal<py::object>(
+                              PySequence_GetItem(err_obj, failed_idx))
+                              .ptr())
+                      ->tp_name,
+                  failed_idx));
+        }
+        TORCH_CHECK_TYPE(
+            false,
+            fmt::format(
+                "{}(): argument '{}' (position {}) must be {}, not {}",
+                name,
+                param.name,
+                arg_pos + 1,
+                param.type_name(),
+                Py_TYPE(obj)->tp_name));
+      }
+    } else {
+      return false;
+    }
+
+    if (!is_kwd) {
+      arg_pos++;
+    } else if (obj) {
+      remaining_kwargs--;
+    }
+  }
+
+  if (remaining_kwargs > 0) {
+    if (raise_exception) {
+      // Build a kwargs dict for the error message
+      auto kwargs_dict = py::dict();
+      for (Py_ssize_t j = 0; j < num_kwnames; j++) {
+        kwargs_dict[py::handle(PyTuple_GET_ITEM(kwnames, j))] =
+            py::handle(args[nargs + j]);
+      }
+      extra_kwargs(*this, kwargs_dict.ptr(), nargs);
+    }
+    return false;
+  }
+  return true;
+}
+
+PythonArgs PythonArgParser::raw_parse(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames,
+    PyObject* parsed_args[]) { // NOLINT
+  if (signatures_.size() == 1) {
+    auto& signature = signatures_[0];
+    std::vector<PyObject*> overloaded_args;
+    py::object varargs_tuple;
+    signature.parse(
+        self, args, nargs, kwnames, parsed_args, overloaded_args, true,
+        varargs_tuple);
+    check_deprecated(signature);
+    PythonArgs result(
+        traceable, signature, parsed_args, std::move(overloaded_args));
+    result.varargs_tuple = std::move(varargs_tuple);
+    return result;
+  }
+
+  for (auto& signature : signatures_) {
+    std::vector<PyObject*> overloaded_args;
+    py::object varargs_tuple;
+    if (signature.parse(
+            self, args, nargs, kwnames, parsed_args, overloaded_args, false,
+            varargs_tuple)) {
+      check_deprecated(signature);
+      PythonArgs result(
+          traceable, signature, parsed_args, std::move(overloaded_args));
+      result.varargs_tuple = std::move(varargs_tuple);
+      return result;
+    }
+  }
+
+  print_error(self, args, nargs, kwnames, parsed_args);
+}
+
+void PythonArgParser::print_error(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames,
+    PyObject* parsed_args[]) { // NOLINT
+  Py_ssize_t num_kwnames = kwnames ? PyTuple_GET_SIZE(kwnames) : 0;
+  size_t num_args = nargs + num_kwnames;
+  std::vector<unsigned> plausible_idxs;
+  unsigned i = 0;
+  for (auto& signature : signatures_) {
+    if (num_args >= signature.min_args && num_args <= signature.max_args &&
+        !signature.hidden) {
+      plausible_idxs.push_back(i);
+    }
+    i++;
+  }
+
+  if (plausible_idxs.size() == 1) {
+    auto& signature = signatures_[plausible_idxs[0]];
+    std::vector<PyObject*> overloaded_args;
+    py::object varargs_tuple;
+    signature.parse(
+        self, args, nargs, kwnames, parsed_args, overloaded_args, true,
+        varargs_tuple);
+  }
+
+  // Build tuple and dict for format_invalid_args
+  auto args_tuple = py::reinterpret_steal<py::object>(
+      make_tuple_from_array(args, nargs));
+  py::object kwargs_dict;
+  if (num_kwnames > 0) {
+    auto d = py::dict();
+    for (Py_ssize_t j = 0; j < num_kwnames; j++) {
+      d[py::handle(PyTuple_GET_ITEM(kwnames, j))] =
+          py::handle(args[nargs + j]);
+    }
+    kwargs_dict = std::move(d);
+  }
+  auto options = get_signatures();
+  auto msg = torch::format_invalid_args(
+      args_tuple.ptr(), kwargs_dict.ptr(), function_name + "()", options);
   TORCH_CHECK_TYPE(false, msg);
 }
 

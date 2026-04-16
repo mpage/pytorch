@@ -835,7 +835,7 @@ def generate_return_type_declarations(
 PY_VARIABLE_METHOD_VARARGS = CodeTemplate(
     r"""\
 // ${name}
-static PyObject * ${pycname}(PyObject* self_, PyObject* args, PyObject* kwargs)
+static PyObject * ${pycname}(PyObject* self_, PyObject* const* args, Py_ssize_t nargs, PyObject* kwnames)
 {
   ${method_header}
   static PythonArgParser parser({
@@ -843,7 +843,7 @@ static PyObject * ${pycname}(PyObject* self_, PyObject* args, PyObject* kwargs)
   }, /*traceable=*/${traceable});
 
   ParsedArgs<${max_args}> parsed_args;
-  auto _r = parser.parse(${self_}, args, kwargs, parsed_args);
+  auto _r = parser.parse(${self_}, args, nargs, kwnames, parsed_args);
   ${check_has_torch_function}
   switch (_r.idx) {
     ${dispatch}
@@ -869,7 +869,7 @@ case ${overload_index}: {
 PY_VARIABLE_METHOD_VARARGS_SINGLETON = CodeTemplate(
     """\
 // ${name}
-static PyObject * ${pycname}(PyObject* self_, PyObject* args, PyObject* kwargs)
+static PyObject * ${pycname}(PyObject* self_, PyObject* const* args, Py_ssize_t nargs, PyObject* kwnames)
 {
   ${method_header}
   static PythonArgParser parser({
@@ -877,7 +877,7 @@ static PyObject * ${pycname}(PyObject* self_, PyObject* args, PyObject* kwargs)
   }, /*traceable=*/${traceable});
 
   ParsedArgs<${max_args}> parsed_args;
-  auto _r = parser.parse(${self_}, args, kwargs, parsed_args);
+  auto _r = parser.parse(${self_}, args, nargs, kwnames, parsed_args);
   ${check_has_torch_function}
   ${dispatch}
   ${method_footer}
@@ -1001,7 +1001,7 @@ if (has_torch_function(self_)) {{
 
     return f"""\
 if(_r.has_torch_function()) {{
-  return handle_torch_function(_r, {self_}, args, kwargs, {namespace}, "{module or "torch.Tensor"}");
+  return handle_torch_function(_r, {self_}, args, nargs, kwnames, {namespace}, "{module or "torch.Tensor"}");
 }}
 """
 
@@ -1077,7 +1077,7 @@ static PyObject * {pycname}(PyObject* self_, PyObject* args);
     else:
         return (
             f"""\
-static PyObject * {pycname}(PyObject* self_, PyObject* args, PyObject* kwargs);
+static PyObject * {pycname}(PyObject* self_, PyObject* const* args, Py_ssize_t nargs, PyObject* kwnames);
 """,
         )
 
@@ -1106,10 +1106,13 @@ def method_def(
         pycname = f"TypeError_to_NotImplemented_<{pycname}>"
 
     if is_noarg(overloads):
+        # No-arg methods use METH_NOARGS with (self, unused) signature.
+        # No-arg non-methods (torch functions) use METH_VARARGS | METH_KEYWORDS
+        # because the NOARGS template signature doesn't match FASTCALL.
         flags = "METH_NOARGS" if method else "METH_VARARGS | METH_KEYWORDS"
     else:
-        pycname = f"castPyCFunctionWithKeywords({pycname})"
-        flags = "METH_VARARGS | METH_KEYWORDS"
+        pycname = f"castPyCFunctionFastWithKeywords({pycname})"
+        flags = "METH_FASTCALL | METH_KEYWORDS"
 
     if module == "torch":
         flags += " | METH_STATIC"

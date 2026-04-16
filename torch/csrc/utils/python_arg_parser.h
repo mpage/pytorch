@@ -198,6 +198,21 @@ struct FunctionSignature {
       std::vector<PyObject*>& overloaded_args,
       bool raise_exception);
 
+  // METH_FASTCALL | METH_KEYWORDS variant: positional args as a C array,
+  // keyword names as a tuple with values at args[nargs + i].
+  // varargs_tuple_out receives ownership of a temporary tuple created for
+  // varargs IntArrayRef (e.g. view(1,2,3)), or is left untouched otherwise.
+  bool parse(
+      PyObject* self,
+      PyObject* const* args,
+      Py_ssize_t nargs,
+      PyObject* kwnames,
+      // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+      PyObject* dst[],
+      std::vector<PyObject*>& overloaded_args,
+      bool raise_exception,
+      py::object& varargs_tuple_out);
+
   std::string toString() const;
 
   std::string name;
@@ -230,6 +245,15 @@ struct PYBIND11_EXPORT PythonArgParser {
 
   inline PythonArgs parse(PyObject* self, ParsedArgs<0>& dst);
 
+  // METH_FASTCALL | METH_KEYWORDS overloads
+  template <int N>
+  inline PythonArgs parse(
+      PyObject* self,
+      PyObject* const* args,
+      Py_ssize_t nargs,
+      PyObject* kwnames,
+      ParsedArgs<N>& dst);
+
   // Formatted strings of non-hidden signatures
   std::vector<std::string> get_signatures() const;
 
@@ -240,11 +264,25 @@ struct PYBIND11_EXPORT PythonArgParser {
       PyObject* kwargs,
       // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
       PyObject* parsed_args[]);
+  [[noreturn]] void print_error(
+      PyObject* self,
+      PyObject* const* args,
+      Py_ssize_t nargs,
+      PyObject* kwnames,
+      // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+      PyObject* parsed_args[]);
   void check_deprecated(const FunctionSignature& signature);
   PythonArgs raw_parse(
       PyObject* self,
       PyObject* args,
       PyObject* kwargs,
+      // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+      PyObject* parsed_args[]);
+  PythonArgs raw_parse(
+      PyObject* self,
+      PyObject* const* args,
+      Py_ssize_t nargs,
+      PyObject* kwnames,
       // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
       PyObject* parsed_args[]);
 
@@ -274,6 +312,10 @@ struct TORCH_PYTHON_API PythonArgs {
   const FunctionSignature& signature;
   PyObject** args;
   std::vector<PyObject*> overloaded_args; // NOTE: borrowed references
+  // Owns a temporary tuple created for the varargs IntArrayRef case
+  // (e.g. view(1,2,3)) when using the METH_FASTCALL path.
+  // Uses py::object (not THPObjectPtr) to keep PythonArgs copyable.
+  py::object varargs_tuple;
 
   inline bool has_torch_function();
   inline std::string get_func_name();
@@ -383,6 +425,23 @@ inline PythonArgs PythonArgParser::parse(
 
 inline PythonArgs PythonArgParser::parse(PyObject* self, ParsedArgs<0>& dst) {
   return parse(self, nullptr, nullptr, dst);
+}
+
+template <int N>
+inline PythonArgs PythonArgParser::parse(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames,
+    ParsedArgs<N>& dst) {
+  TORCH_CHECK_VALUE(
+      N >= max_args,
+      "PythonArgParser: dst ParsedArgs buffer does not have enough capacity, expected ",
+      max_args,
+      " (got ",
+      N,
+      ")");
+  return raw_parse(self, args, nargs, kwnames, dst.args);
 }
 
 inline bool PythonArgs::has_torch_function() {
@@ -1258,6 +1317,27 @@ auto handle_torch_function(
     PythonArgs& r,
     PyObject* args,
     PyObject* kwargs,
+    PyObject* torch_api,
+    const char* module_name,
+    const char* func_name_override = nullptr) -> PyObject*;
+
+// METH_FASTCALL | METH_KEYWORDS variants: positional args as a C array,
+// keyword names as a tuple with values at args[nargs + i].
+auto handle_torch_function(
+    PythonArgs& r,
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames,
+    PyObject* torch_api,
+    const char* module_name,
+    const char* func_name_override = nullptr) -> PyObject*;
+
+auto handle_torch_function(
+    PythonArgs& r,
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames,
     PyObject* torch_api,
     const char* module_name,
     const char* func_name_override = nullptr) -> PyObject*;
